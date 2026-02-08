@@ -15,10 +15,10 @@ export type CheckpointConfig = { configurable: { thread_id: string, checkpoint_i
 
 /** Represents LangGraph checkpoint metadata */
 export type CheckpointMetadata = {
-  source: string;
-  step: number;
-  writes: Record<string, object | object[]>;
-  parents: Record<string, string>;
+  source?: string;
+  step?: number;
+  writes?: Record<string, object | object[]>;
+  parents?: Record<string, string>;
 };
 
 /** Generic interface for an interruption (Human in the loop). Value can be anything. */

@@ -19,8 +19,10 @@ def checkpoint_event(value):
             ]
         return formatted_values
 
-    def format_writes(writes: dict):
+    def format_writes(writes):
         if writes is None:
+            return None
+        if not isinstance(writes, dict):
             return None
         formatted_writes = {}
         for key, value in writes.items():
@@ -33,11 +35,18 @@ def checkpoint_event(value):
                 formatted_writes[key] = value
         return formatted_writes
 
-    configurable = value["payload"]["config"]["configurable"]
-    # print(f"WRITES {value["payload"]}")
+    payload = value.get("payload", {})
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    configurable = payload["config"]["configurable"]
+    # print(f"WRITES {payload}")
+    writes = metadata.get("writes")
+    if writes is None and "writes" in payload:
+        writes = payload.get("writes")
     data = {
-        "next": value["payload"]["next"],
-        "values": format_values(value["payload"]["values"]),
+        "next": payload["next"],
+        "values": format_values(payload["values"]),
         "config": {
             "configurable": {
                 "checkpoint_id": configurable["checkpoint_id"],
@@ -45,13 +54,16 @@ def checkpoint_event(value):
                 "thread_id": configurable["thread_id"]
             }
         },
-        "metadata": {
-            "source": value["payload"]["metadata"]["source"],
-            "step": value["payload"]["metadata"]["step"],
-            "writes": format_writes(value["payload"]["metadata"]["writes"]),
-            "parents": value["payload"]["metadata"]["parents"]
-        }
     }
+    metadata_payload = {
+        "source": metadata.get("source"),
+        "step": metadata.get("step"),
+        "writes": format_writes(writes),
+        "parents": metadata.get("parents"),
+    }
+    metadata_payload = {key: val for key, val in metadata_payload.items() if val is not None}
+    if metadata_payload:
+        data["metadata"] = metadata_payload
     return {
         "event": "checkpoint",
         "data": json.dumps(data)

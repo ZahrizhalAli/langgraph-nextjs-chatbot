@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import {
   Checkpoint,
   Interrupt,
@@ -15,6 +15,7 @@ import {
   ToolCall,
   WithMessages,
   NodeMessageChunk,
+  Message,
 } from './types';
 import { callAgentRoute } from './api';
 import { getHistory, stopAgent } from './actions';
@@ -49,6 +50,7 @@ export function useLangGraphAgent<TAgentState extends object | WithMessages, TIn
   const [status, setStatus] = useState<AgentStatus>('idle');
   const [restoring, setRestoring] = useState(false);
   const [appCheckpoints, setAppCheckpoints] = useState<AppCheckpoint<TAgentState, TInterruptValue>[]>([]);
+  const lastUserMessageKeyRef = useRef<string | undefined>(undefined);
 
 
   /**
@@ -232,6 +234,7 @@ export function useLangGraphAgent<TAgentState extends object | WithMessages, TIn
     // Create a new app checkpoint except for the last checkpoint.
     if (checkpoint.next.length > 0) {
       const newAppCheckpoint = createAppCheckpoint(checkpoint);
+      ensureUserMessageNode(newAppCheckpoint, checkpoint);
 
       // When restoring checkpoints from graph history, the checkpoint stores interrupts as interrupts property.
       if (checkpoint.interrupts) {
@@ -268,14 +271,14 @@ export function useLangGraphAgent<TAgentState extends object | WithMessages, TIn
     // Create a new checkpoint except for the last checkpoint. Do not create a new checkpoint if there was an interruption in the last checkpoint.
     if (checkpoint.next.length > 0 && !interruptionInLastCheckpoint) {
       const newCheckpoint = createAppCheckpoint(checkpoint);
+      ensureUserMessageNode(newCheckpoint, checkpoint);
       appCheckpoints.push(newCheckpoint);
       onCheckpointStart?.(newCheckpoint);
     }
   }
 
   function createAppCheckpoint(checkpoint: Checkpoint<TAgentState, TInterruptValue>): AppCheckpoint<TAgentState, TInterruptValue> {
-    return {
-      nodes: checkpoint.next.map((x, index) => {
+    const nodes = checkpoint.next.map((x, index) => {
         const matchingKey = Object.keys(checkpoint.metadata?.writes ?? {}).find(key => key === x);
         const value = matchingKey ? checkpoint.metadata?.writes?.[matchingKey] : undefined;
         return {
@@ -286,7 +289,10 @@ export function useLangGraphAgent<TAgentState extends object | WithMessages, TIn
               : deepCopy(value as TAgentState)
             : {} as TAgentState
         };
-      }),
+      });
+
+    return {
+      nodes,
       stateInitial: deepCopy(checkpoint.values),
       state: deepCopy(checkpoint.values),
       stateDiff: {} as TAgentState,
@@ -295,14 +301,100 @@ export function useLangGraphAgent<TAgentState extends object | WithMessages, TIn
     };
   }
 
+  function getLatestUserMessageWithKey(checkpoint: Checkpoint<TAgentState, TInterruptValue>) {
+    if (!('messages' in checkpoint.values)) {
+      return undefined;
+    }
+
+    const messages = (checkpoint.values as unknown as WithMessages).messages;
+    if (!Array.isArray(messages)) {
+      return undefined;
+    }
+
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const message = messages[i] as Message;
+      if (message?.type === 'user' || message?.type === 'human') {
+        const key = `${message.id ?? message.content}::${i}`;
+        return { message, key };
+      }
+    }
+
+    return undefined;
+  }
+
+  function ensureUserMessageNode(appCheckpoint: AppCheckpoint<TAgentState, TInterruptValue>, checkpoint: Checkpoint<TAgentState, TInterruptValue>) {
+    const latest = getLatestUserMessageWithKey(checkpoint);
+    if (!latest) {
+      return;
+    }
+
+    if (latest.key === lastUserMessageKeyRef.current) {
+      return;
+    }
+
+    const targetNode =
+      appCheckpoint.nodes.find(node => node.name === 'chatbot') ??
+      appCheckpoint.nodes.find(node => node.name === '__start__');
+
+    if (targetNode) {
+      const stateWithMessages = targetNode.state as unknown as WithMessages;
+      const existingMessages = Array.isArray(stateWithMessages.messages) ? stateWithMessages.messages : [];
+      const latestKey = getMessageKey(latest.message);
+      const alreadyPresent = existingMessages.some((msg) => getMessageKey(msg) === latestKey);
+      if (!alreadyPresent) {
+        stateWithMessages.messages = [deepCopy(latest.message), ...existingMessages];
+        targetNode.state = stateWithMessages as unknown as TAgentState;
+      }
+    } else {
+      appCheckpoint.nodes.unshift({
+        name: '__start__',
+        state: { messages: [deepCopy(latest.message)] } as unknown as TAgentState
+      });
+    }
+
+    lastUserMessageKeyRef.current = latest.key;
+  }
+
+  function getMessageKey(message: Message) {
+    if (message.id) {
+      return message.id;
+    }
+    return `${message.type}:${message.content}:${JSON.stringify(message.tool_calls ?? [])}`;
+  }
+
+  function mergeMessages(existing: Message[], incoming: Message[]) {
+    const merged = [...existing];
+    incoming.forEach((message) => {
+      const key = getMessageKey(message);
+      const exists = merged.some((msg) => getMessageKey(msg) === key);
+      if (!exists) {
+        merged.push(deepCopy(message) as Message);
+      }
+    });
+    return merged;
+  }
+
   function updateGraphNodeStateFromMetadata(appCheckpoint: AppCheckpoint<TAgentState, TInterruptValue>, checkpoint: Checkpoint<TAgentState, TInterruptValue>) {
     // Update nodes states with the writes from the checkpoint metadata
     Object.entries(checkpoint.metadata?.writes ?? {}).forEach(([key, value]) => {
       const matchingNodes = appCheckpoint.nodes.filter(node => node.name === key);
       matchingNodes.forEach((node, index) => {
-        node.state = Array.isArray(value)
-          ? deepCopy((value as Partial<TAgentState>[])[index] as TAgentState)
-          : deepCopy(value as TAgentState);
+        const nextValue = Array.isArray(value)
+          ? (value as Partial<TAgentState>[])[index] as TAgentState
+          : value as TAgentState;
+        const safeNextValue = (nextValue ?? {}) as TAgentState;
+
+        const existingMessages = (node.state as unknown as WithMessages).messages;
+        const nextMessages = (safeNextValue as unknown as WithMessages).messages;
+
+        if (Array.isArray(existingMessages)) {
+          const mergedMessages = Array.isArray(nextMessages)
+            ? mergeMessages(existingMessages, nextMessages)
+            : deepCopy(existingMessages) as Message[];
+          node.state = { ...deepCopy(safeNextValue), messages: mergedMessages } as TAgentState;
+        } else {
+          node.state = deepCopy(safeNextValue as TAgentState);
+        }
       });
     });
   }
